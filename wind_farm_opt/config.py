@@ -12,6 +12,11 @@ import numpy as np
 from .core.turbine import Turbine, create_default_turbine
 from .core.wind_resource import WindResource, create_default_wind_resource
 from .core.wake import JensenWake, GaussianWake, WakeModel
+from .farm.operation import (
+    HOURS_PER_YEAR,
+    OperatingPeriod,
+    OperatingScenario,
+)
 from .constraints.boundary import (
     SiteBoundary,
     create_rectangular_boundary,
@@ -48,6 +53,146 @@ class EconomicConfig:
 
 
 @dataclass
+class OperationConfig:
+    """按月/自定义时段的运行情景配置。
+
+    JSON 示例（显式时段）::
+
+        "operation": {
+          "total_hours": 8760,
+          "require_full_coverage": true,
+          "periods": [
+            {"name": "1月", "hours": 744,
+             "availability": 0.95,
+             "grid_capacity_mw": 35.0},
+            {"name": "2月", "hours": 672,
+             "availability": [0.8, 0.95, ...],
+             "grid_capacity_mw": null}
+          ]
+        }
+
+    也支持便捷的 12 个自然月写法（小时数自动取 744/672/...，合计 8760）::
+
+        "operation": {
+          "monthly": {
+            "availability": [0.95, 0.90, ...],
+            "grid_capacities_mw": [35.0, null, ...]
+          }
+        }
+
+    未配置 ``periods`` 或 ``monthly`` 时，运行情景功能视为关闭，
+    旧的 8760 小时满发 AEP 流程保持原值不变。
+    """
+
+    enabled: bool = False
+    total_hours: Optional[float] = 8760.0
+    require_full_coverage: bool = True
+    periods: List[dict] = field(default_factory=list)
+    monthly: Optional[dict] = None
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "OperationConfig":
+        """从 JSON 字典构建配置；缺省/空配置返回禁用状态。"""
+        if not data:
+            return cls()
+        periods = data.get("periods")
+        monthly = data.get("monthly")
+        enabled = bool(periods) or bool(monthly)
+        return cls(
+            enabled=enabled,
+            total_hours=data.get("total_hours", HOURS_PER_YEAR),
+            require_full_coverage=bool(data.get("require_full_coverage", True)),
+            periods=list(periods) if periods else [],
+            monthly=dict(monthly) if monthly else None,
+        )
+
+    def _build_period_wind_resource(
+        self, spec: Optional[dict]
+    ) -> Optional[WindResource]:
+        """根据时段内联风资源描述构建风资源；缺省返回 None（用默认风资源）。"""
+        if spec is None:
+            return None
+        rtype = spec.get("type", "default").lower()
+        p = spec.get("params", {})
+        if rtype == "default":
+            return create_default_wind_resource(
+                num_sectors=p.get("num_sectors", 12),
+                dominant_direction=p.get("dominant_direction", 270.0),
+                mean_speed=p.get("mean_speed", 8.5),
+            )
+        if rtype == "uniform":
+            from .core.wind_resource import create_simple_wind_resource
+            return create_simple_wind_resource(
+                num_sectors=p.get("num_sectors", 12),
+                uniform=True,
+                mean_speed=p.get("mean_speed", 8.0),
+            )
+        raise ValueError(f"运行时段使用了未知的风资源类型: {rtype}")
+
+    def create_scenario(
+        self,
+        n_turbines: int,
+        default_wind_resource: WindResource,
+        installed_capacity_mw: float,
+    ) -> Optional[OperatingScenario]:
+        """构建已通过运行前校验的运行情景；功能未启用时返回 None。"""
+        if not self.enabled:
+            return None
+
+        if self.periods:
+            periods = []
+            for p in self.periods:
+                if "hours" not in p:
+                    raise ValueError(
+                        f"运行时段 {p.get('name', '<未命名>')!r} 缺少 hours 字段"
+                    )
+                availability = p.get("availability", None)
+                if availability is not None:
+                    availability = np.asarray(availability, dtype=np.float64)
+                    if availability.ndim == 0:
+                        availability = float(availability)
+                periods.append(
+                    OperatingPeriod(
+                        name=str(p["name"]),
+                        hours=float(p["hours"]),
+                        wind_resource=self._build_period_wind_resource(
+                            p.get("wind_resource")
+                        ),
+                        availability=availability,
+                        grid_capacity_mw=p.get("grid_capacity_mw", None),
+                        curtailment_rule=p.get("curtailment_rule", "proportional"),
+                    )
+                )
+        elif self.monthly is not None:
+            from .farm.operation import create_monthly_periods
+
+            m = self.monthly
+            wind_specs = m.get("wind_resources", None)
+            wind_resources = (
+                [self._build_period_wind_resource(spec) for spec in wind_specs]
+                if wind_specs
+                else None
+            )
+            avail = m.get("availability", None)
+            periods = create_monthly_periods(
+                availabilities=avail,
+                grid_capacities_mw=m.get("grid_capacities_mw", None),
+                wind_resources=wind_resources,
+            )
+        else:
+            return None
+
+        return OperatingScenario(
+            periods=periods,
+            n_turbines=n_turbines,
+            total_hours=self.total_hours,
+            default_wind_resource=default_wind_resource,
+            require_full_coverage=self.require_full_coverage,
+            installed_capacity_mw=installed_capacity_mw,
+        )
+
+
+@dataclass
 class WindFarmConfig:
     """完整的风电场分析配置。"""
     n_turbines: int = 15
@@ -74,6 +219,7 @@ class WindFarmConfig:
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     economic: EconomicConfig = field(default_factory=EconomicConfig)
+    operation: OperationConfig = field(default_factory=OperationConfig)
 
     @classmethod
     def from_json(cls, filepath: str) -> "WindFarmConfig":
@@ -84,6 +230,7 @@ class WindFarmConfig:
         opt_config = OptimizationConfig(**data.get("optimization", {}))
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
+        op_config = OperationConfig.from_dict(data.get("operation"))
 
         return cls(
             n_turbines=data.get("n_turbines", 15),
@@ -98,6 +245,7 @@ class WindFarmConfig:
             optimization=opt_config,
             visualization=vis_config,
             economic=econ_config,
+            operation=op_config,
         )
 
     def to_json(self, filepath: str) -> None:
@@ -115,6 +263,13 @@ class WindFarmConfig:
             "optimization": self.optimization.__dict__,
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
+            "operation": {
+                "enabled": self.operation.enabled,
+                "total_hours": self.operation.total_hours,
+                "require_full_coverage": self.operation.require_full_coverage,
+                "periods": self.operation.periods,
+                "monthly": self.operation.monthly,
+            },
         }
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

@@ -218,6 +218,8 @@ class AEPCalculator:
         self,
         positions: np.ndarray,
         sector_idx: int,
+        hours: float = 8760.0,
+        wind_resource: Optional[WindResource] = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """计算单个风向扇区的发电量。
 
@@ -227,6 +229,10 @@ class AEPCalculator:
             风机位置 (N_turb, 2)
         sector_idx : int
             扇区索引
+        hours : float
+            该时段的小时数（电量权重），默认全年 8760 小时
+        wind_resource : Optional[WindResource]
+            该时段使用的风资源，默认使用计算器绑定的风资源
 
         Returns
         -------
@@ -235,13 +241,12 @@ class AEPCalculator:
             - 每台风机的理论发电量 (N_turb,)
             - 每台风机的功率损失来源矩阵 (N_turb, N_turb)
         """
-        sector = self.wind_resource.sectors[sector_idx]
+        resource = self.wind_resource if wind_resource is None else wind_resource
+        sector = resource.sectors[sector_idx]
         freq = sector.frequency
         wind_dir = sector.direction_center
-        c = sector.weibull_c
-        k = sector.weibull_k
 
-        pdf = self.wind_resource.weibull_pdf(self._speed_centers, sector_idx)
+        pdf = resource.weibull_pdf(self._speed_centers, sector_idx)
         prob = pdf * self.speed_step
 
         total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
@@ -263,8 +268,9 @@ class AEPCalculator:
 
         gross_power = self._power_lookup
 
-        hours_per_year = 8760.0
-        weighting = freq * hours_per_year * prob
+        # 扇区频率是该时段内的条件概率，hours 是时段唯一的时间权重，
+        # 不在任何其他地方再次乘小时数，避免权重重复计入。
+        weighting = freq * hours * prob
 
         gross_aep_sector = np.sum(gross_power * weighting, axis=1)
         net_aep_sector = np.sum(net_power * weighting, axis=1)
@@ -273,11 +279,118 @@ class AEPCalculator:
             positions,
             wind_dir,
             freq,
-            hours_per_year,
+            hours,
             prob,
         )
 
         return net_aep_sector, gross_aep_sector, loss_by_source
+
+    def compute_period_power_distribution(
+        self,
+        positions: np.ndarray,
+        hours: float,
+        wind_resource: Optional[WindResource] = None,
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """计算时段内各风向/风速状态下的逐机功率分布。
+
+        用于在"风向 × 风速"状态级别施加可利用率与并网功率上限，
+        避免用时段平均功率近似限发造成的高估。
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            风机位置 (N_turb, 2)
+        hours : float
+            时段小时数（唯一的时间权重，由调用方在积分时乘一次）
+        wind_resource : Optional[WindResource]
+            时段风资源，默认使用计算器绑定的风资源
+
+        Returns
+        -------
+        tuple[float, np.ndarray, np.ndarray, np.ndarray]
+            - hours: 时段小时数
+            - weights: 状态概率权重 (N_sector, N_speed)，元素为
+              ``扇区频率 × 风速概率``，全体求和为 1
+            - gross_power: 各状态逐机毛功率 (kW)，
+              形状 (N_sector, N_turb, N_speed)
+            - net_power: 各状态逐机尾流后功率 (kW)，形状同上
+        """
+        resource = self.wind_resource if wind_resource is None else wind_resource
+        positions = np.asarray(positions, dtype=np.float64)
+
+        n_turb = len(self.turbines)
+        n_speed = len(self._speed_centers)
+        n_sector = resource.num_sectors
+
+        weights = np.zeros((n_sector, n_speed), dtype=np.float64)
+        gross_power = np.zeros((n_sector, n_turb, n_speed), dtype=np.float64)
+        net_power = np.zeros((n_sector, n_turb, n_speed), dtype=np.float64)
+
+        for s_idx in range(n_sector):
+            sector = resource.sectors[s_idx]
+            prob = resource.weibull_pdf(self._speed_centers, s_idx) * self.speed_step
+            weights[s_idx] = sector.frequency * prob
+
+            total_deficit = self._compute_wake_deficit_field(
+                positions, sector.direction_center
+            )
+            effective_speeds = self._speed_centers[np.newaxis, :] * (
+                1.0 - total_deficit[:, np.newaxis]
+            )
+            for i in range(n_turb):
+                net_power[s_idx, i] = np.interp(
+                    effective_speeds[i],
+                    self._power_curves[i][:, 0],
+                    self._power_curves[i][:, 1],
+                    left=0.0,
+                    right=0.0,
+                )
+            gross_power[s_idx] = self._power_lookup
+
+        return float(hours), weights, gross_power, net_power
+
+    def compute_period_energy(
+        self,
+        positions: np.ndarray,
+        hours: float,
+        wind_resource: Optional[WindResource] = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """计算给定时段（指定小时数与风资源）的逐机能量。
+
+        与年度 AEP 使用完全相同的尾流与功率曲线积分，只是把时间权重
+        从固定的 8760 小时替换为给定的时段小时数。
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            风机位置 (N_turb, 2)
+        hours : float
+            时段小时数
+        wind_resource : Optional[WindResource]
+            时段风资源，默认使用计算器绑定的风资源
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray, np.ndarray]
+            - 逐机毛能量（无尾流）(kWh)，形状 (N_turb,)
+            - 逐机尾流后能量 (kWh)，形状 (N_turb,)
+            - 尾流损失来源矩阵 (kWh)，形状 (N_turb, N_turb)
+        """
+        resource = self.wind_resource if wind_resource is None else wind_resource
+
+        gross = np.zeros(len(self.turbines), dtype=np.float64)
+        net = np.zeros(len(self.turbines), dtype=np.float64)
+        loss_by_source = np.zeros((len(self.turbines), len(self.turbines)), dtype=np.float64)
+
+        for s_idx in range(resource.num_sectors):
+            net_s, gross_s, loss_s = self._compute_sector_aep(
+                positions, s_idx, hours=hours, wind_resource=resource
+            )
+            net += net_s
+            gross += gross_s
+            loss_by_source += loss_s
+
+        return gross, net, loss_by_source
 
     def _compute_loss_by_source(
         self,

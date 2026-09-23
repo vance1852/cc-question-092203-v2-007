@@ -18,6 +18,11 @@ from .core.wind_resource import WindResource
 from .core.wake import WakeModel
 from .constraints.boundary import SiteBoundary
 from .farm.aep import AEPCalculator, FarmResult
+from .farm.operation import (
+    OperationalEnergyCalculator,
+    ScenarioEnergyResult,
+    ScenarioValidationError,
+)
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
@@ -61,6 +66,20 @@ class WindFarmOptimizerCLI:
             wake_superposition=config.superposition_method,
         )
 
+        # 运行情景（按月/自定义时段）：在任何计算之前构建并完成运行前校验，
+        # 缺失月份、小时权重不闭合、可利用率越界、容量上限冲突都会在此抛出。
+        installed_capacity_mw = float(np.sum(self.rated_powers)) / 1e3
+        self.operating_scenario = config.operation.create_scenario(
+            n_turbines=len(self.turbines),
+            default_wind_resource=self.wind_resource,
+            installed_capacity_mw=installed_capacity_mw,
+        )
+        self.operational_calc = (
+            OperationalEnergyCalculator(self.aep_calc)
+            if self.operating_scenario is not None
+            else None
+        )
+
         self.baseline_positions: Optional[np.ndarray] = None
         self.baseline_result: Optional[FarmResult] = None
         self.optimized_positions: Optional[np.ndarray] = None
@@ -68,6 +87,8 @@ class WindFarmOptimizerCLI:
         self.optimize_result = None
         self.economic_result: Optional[EconomicResult] = None
         self.sweep_results: Optional[dict] = None
+        self.baseline_energy: Optional[ScenarioEnergyResult] = None
+        self.optimized_energy: Optional[ScenarioEnergyResult] = None
 
     def _setup_output_dir(self) -> None:
         """创建输出目录。"""
@@ -96,6 +117,25 @@ class WindFarmOptimizerCLI:
         if max_loss_turb.dominant_wake_source is not None:
             print(f"    主要影响源: #{max_loss_turb.dominant_wake_source}")
 
+    def _evaluate_operating_scenario(
+        self, positions: np.ndarray, label: str
+    ) -> Optional[ScenarioEnergyResult]:
+        """在给定布局上计算运行情景的五级电量分解并打印。"""
+        if self.operational_calc is None or self.operating_scenario is None:
+            return None
+
+        energy = self.operational_calc.compute_scenario(
+            positions, self.operating_scenario
+        )
+        s = energy.loss_summary()
+        print(f"\n  [{label}] 运行情景电量分解（{energy.total_hours:g} 小时，{len(energy.periods)} 个时段）:")
+        print(f"    毛发电:        {s['gross_mwh']/1e3:8.2f} GWh")
+        print(f"    尾流损失:      {s['wake_loss_mwh']/1e3:8.2f} GWh ({s['wake_loss_pct']:.2f}%)")
+        print(f"    不可利用损失:  {s['unavailability_loss_mwh']/1e3:8.2f} GWh ({s['unavailability_loss_pct']:.2f}%)")
+        print(f"    限发损失:      {s['curtailment_loss_mwh']/1e3:8.2f} GWh ({s['curtailment_loss_pct']:.2f}%)")
+        print(f"    最终上网电量:  {s['grid_mwh']/1e3:8.2f} GWh")
+        return energy
+
     def run_baseline(self) -> None:
         """运行基线（规则网格布局）评估。"""
         self._print_header("步骤 1/6: 生成并评估基线网格布局")
@@ -113,6 +153,9 @@ class WindFarmOptimizerCLI:
 
         self.baseline_result = self.aep_calc.compute_farm_aep(self.baseline_positions)
         self._print_result_summary(self.baseline_result, "基线布局")
+        self.baseline_energy = self._evaluate_operating_scenario(
+            self.baseline_positions, "基线布局"
+        )
 
     def run_optimization(self) -> None:
         """运行机位优化。"""
@@ -161,6 +204,9 @@ class WindFarmOptimizerCLI:
 
         print("\n--- 优化后结果 ---")
         self._print_result_summary(self.optimized_result, "优化后布局")
+        self.optimized_energy = self._evaluate_operating_scenario(
+            self.optimized_positions, "优化后布局"
+        )
 
         if self.baseline_result is not None:
             improvement = (
@@ -191,6 +237,18 @@ class WindFarmOptimizerCLI:
         else:
             result = self.optimized_result
 
+        # 配置了运行情景时，经济分析使用最终上网电量（已扣尾流、
+        # 不可利用与限发损失）；否则沿用旧流程的净 AEP，数值保持不变。
+        scenario_energy = (
+            self.optimized_energy if self.optimized_energy is not None
+            else self.baseline_energy
+        )
+        if scenario_energy is not None:
+            net_aep_gwh = scenario_energy.grid_energy / 1e3
+            print(f"  经济分析电量口径: 运行情景最终上网电量 {net_aep_gwh:.2f} GWh/年")
+        else:
+            net_aep_gwh = result.net_aep / 1e3
+
         turbine_cost = get_default_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
         farm_cost.discount_rate = self.config.economic.discount_rate
@@ -205,7 +263,7 @@ class WindFarmOptimizerCLI:
         self.economic_result = analyzer.analyze(
             n_turbines=self.config.n_turbines,
             rated_power_per_turbine_MW=rated_power_MW,
-            net_aep_GWh=result.net_aep / 1e3,
+            net_aep_GWh=net_aep_gwh,
         )
 
         print(f"\n--- 经济性分析结果（基于优化后布局） ---")
@@ -266,6 +324,21 @@ class WindFarmOptimizerCLI:
                 wake_superposition=self.config.superposition_method,
             )
 
+            # 扫描时风机台数变化，按新台数重建运行情景（逐机可利用率长度、
+            # 装机容量上限校验都依赖台数）；校验失败则跳过该台数。
+            try:
+                scenario = self.config.operation.create_scenario(
+                    n_turbines=n,
+                    default_wind_resource=self.wind_resource,
+                    installed_capacity_mw=float(np.sum(self.rated_powers)) / 1e3,
+                )
+            except ScenarioValidationError as exc:
+                print(f"    跳过: 运行情景校验失败: {exc}")
+                continue
+            op_calc = (
+                OperationalEnergyCalculator(self.aep_calc) if scenario is not None else None
+            )
+
             try:
                 positions = generate_grid_layout(
                     boundary=self.boundary,
@@ -277,18 +350,24 @@ class WindFarmOptimizerCLI:
 
                 result = self.aep_calc.compute_farm_aep(positions)
 
+                if op_calc is not None and scenario is not None:
+                    energy = op_calc.compute_scenario(positions, scenario)
+                    net_aep_mwh = energy.grid_energy
+                else:
+                    net_aep_mwh = result.net_aep
+
                 rated_power_MW = self.turbines[0].rated_power / 1e3
                 econ_result = analyzer.analyze(
                     n_turbines=n,
                     rated_power_per_turbine_MW=rated_power_MW,
-                    net_aep_GWh=result.net_aep / 1e3,
+                    net_aep_GWh=net_aep_mwh / 1e3,
                 )
 
                 sweep_data["n_turbines"].append(n)
-                sweep_data["aep"].append(result.net_aep)
+                sweep_data["aep"].append(net_aep_mwh)
                 sweep_data["lcoe"].append(econ_result.lcoe)
 
-                print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
+                print(f"    净AEP: {net_aep_mwh/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
             except Exception as e:
                 print(f"    跳过: {e}")
 
@@ -456,6 +535,30 @@ class WindFarmOptimizerCLI:
                 "npv_yiyuan": float(self.economic_result.npv / 1e4) if self.economic_result.npv is not None else None,
                 "irr_pct": float(self.economic_result.irr) if self.economic_result.irr is not None else None,
                 "payback_years": float(self.economic_result.payback_period) if self.economic_result.payback_period is not None else None,
+                "energy_basis": "operating_scenario_grid" if (
+                    self.optimized_energy is not None or self.baseline_energy is not None
+                ) else "net_aep",
+            }
+
+        scenario_energy = (
+            self.optimized_energy if self.optimized_energy is not None
+            else self.baseline_energy
+        )
+        if scenario_energy is not None:
+            summary = scenario_energy.loss_summary()
+            results["operation"] = {
+                "total_hours": float(scenario_energy.total_hours),
+                "gross_gwh": float(summary["gross_mwh"] / 1e3),
+                "wake_loss_gwh": float(summary["wake_loss_mwh"] / 1e3),
+                "unavailability_loss_gwh": float(summary["unavailability_loss_mwh"] / 1e3),
+                "curtailment_loss_gwh": float(summary["curtailment_loss_mwh"] / 1e3),
+                "grid_energy_gwh": float(summary["grid_mwh"] / 1e3),
+                "loss_pct_of_gross": {
+                    "wake": float(summary["wake_loss_pct"]),
+                    "unavailability": float(summary["unavailability_loss_pct"]),
+                    "curtailment": float(summary["curtailment_loss_pct"]),
+                },
+                "periods": [p.as_dict() for p in scenario_energy.periods],
             }
 
         if self.baseline_result is not None and self.optimized_result is not None:
@@ -507,6 +610,17 @@ class WindFarmOptimizerCLI:
         print(f"  尾流模型: {self.config.wake_model}")
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
         print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
+        if self.operating_scenario is not None:
+            capped = sum(
+                1 for p in self.operating_scenario.periods if p.grid_capacity_mw is not None
+            )
+            print(
+                f"  运行情景: {len(self.operating_scenario.periods)} 个时段，"
+                f"合计 {sum(p.hours for p in self.operating_scenario.periods):g} 小时"
+                f"（{capped} 个时段送出受限）"
+            )
+        else:
+            print("  运行情景: 未配置，沿用全年 8760 小时满发口径")
 
         if run_baseline:
             self.run_baseline()

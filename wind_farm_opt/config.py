@@ -12,6 +12,11 @@ import numpy as np
 from .core.turbine import Turbine, create_default_turbine
 from .core.wind_resource import WindResource, create_default_wind_resource
 from .core.wake import JensenWake, GaussianWake, WakeModel
+from .farm.operation import (
+    OperatingScenarioSet,
+    build_monthly_scenario,
+    build_scenario_from_dicts,
+)
 from .constraints.boundary import (
     SiteBoundary,
     create_rectangular_boundary,
@@ -48,6 +53,67 @@ class EconomicConfig:
 
 
 @dataclass
+class OperationConfig:
+    """分时段运行情景配置（检修、逐机故障率、送出限发）。
+
+    未启用（``enabled=False``）时，AEP 与经济分析沿用旧流程：
+    全年 8760 小时、机组全可用、电网无限接纳。
+
+    Parameters
+    ----------
+    enabled : bool
+        是否启用分时段运行情景
+    mode : str
+        情景模式："monthly"（便捷12月）或 "custom"（任意自定义时段）
+    curtailment_strategy : str
+        限发分配策略："proportional" 或 "merit_order"
+    availability : object
+        monthly 模式：标量 / 长度12逐月标量 / (12, N) 逐月逐机可利用率
+    grid_capacity_mw : object
+        monthly 模式：None / 标量 / 长度12逐月并网上限 (MW)
+    speed_factors : Optional[list]
+        monthly 模式：长度12的逐月风速缩放比例
+    merit_order : Optional[list]
+        merit_order 策略下的机组优先级
+    periods : list
+        custom 模式下的自定义时段字典列表
+    """
+
+    enabled: bool = False
+    mode: str = "monthly"
+    curtailment_strategy: str = "proportional"
+    availability: object = 1.0
+    grid_capacity_mw: object = None
+    speed_factors: Optional[list] = None
+    merit_order: Optional[list] = None
+    periods: list = field(default_factory=list)
+
+    def create_scenario(
+        self,
+        n_turbines: int,
+        base_wind_resource: WindResource,
+    ) -> OperatingScenarioSet:
+        """根据配置构建运行情景集合（构建后由计算器在运行前统一校验）。"""
+        if self.mode == "monthly":
+            return build_monthly_scenario(
+                base_wind_resource=base_wind_resource,
+                n_turbines=n_turbines,
+                availability=self.availability,
+                grid_capacity_mw=self.grid_capacity_mw,
+                speed_factors=self.speed_factors,
+                curtailment_strategy=self.curtailment_strategy,
+                merit_order=self.merit_order,
+            )
+        if self.mode == "custom":
+            return build_scenario_from_dicts(
+                period_dicts=self.periods,
+                n_turbines=n_turbines,
+                base_wind_resource=base_wind_resource,
+            )
+        raise ValueError(f"未知的运行情景模式: {self.mode!r}（应为 monthly 或 custom）")
+
+
+@dataclass
 class WindFarmConfig:
     """完整的风电场分析配置。"""
     n_turbines: int = 15
@@ -74,6 +140,7 @@ class WindFarmConfig:
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     economic: EconomicConfig = field(default_factory=EconomicConfig)
+    operation: OperationConfig = field(default_factory=OperationConfig)
 
     @classmethod
     def from_json(cls, filepath: str) -> "WindFarmConfig":
@@ -84,6 +151,17 @@ class WindFarmConfig:
         opt_config = OptimizationConfig(**data.get("optimization", {}))
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
+        op_data = data.get("operation", {})
+        op_config = OperationConfig(
+            enabled=op_data.get("enabled", False),
+            mode=op_data.get("mode", "monthly"),
+            curtailment_strategy=op_data.get("curtailment_strategy", "proportional"),
+            availability=op_data.get("availability", 1.0),
+            grid_capacity_mw=op_data.get("grid_capacity_mw", None),
+            speed_factors=op_data.get("speed_factors", None),
+            merit_order=op_data.get("merit_order", None),
+            periods=op_data.get("periods", []),
+        )
 
         return cls(
             n_turbines=data.get("n_turbines", 15),
@@ -98,6 +176,7 @@ class WindFarmConfig:
             optimization=opt_config,
             visualization=vis_config,
             economic=econ_config,
+            operation=op_config,
         )
 
     def to_json(self, filepath: str) -> None:
@@ -115,6 +194,16 @@ class WindFarmConfig:
             "optimization": self.optimization.__dict__,
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
+            "operation": {
+                "enabled": self.operation.enabled,
+                "mode": self.operation.mode,
+                "curtailment_strategy": self.operation.curtailment_strategy,
+                "availability": self.operation.availability,
+                "grid_capacity_mw": self.operation.grid_capacity_mw,
+                "speed_factors": self.operation.speed_factors,
+                "merit_order": self.operation.merit_order,
+                "periods": self.operation.periods,
+            },
         }
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

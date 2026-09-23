@@ -218,6 +218,8 @@ class AEPCalculator:
         self,
         positions: np.ndarray,
         sector_idx: int,
+        wind_resource: Optional[WindResource] = None,
+        hours_per_year: float = 8760.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """计算单个风向扇区的发电量。
 
@@ -227,21 +229,28 @@ class AEPCalculator:
             风机位置 (N_turb, 2)
         sector_idx : int
             扇区索引
+        wind_resource : Optional[WindResource]
+            风资源，默认为计算器绑定的全年风资源；运行情景下可传入时段风资源
+        hours_per_year : float
+            该风资源所覆盖的小时数，全年为 8760；运行情景下为时段小时数
 
         Returns
         -------
         tuple[np.ndarray, np.ndarray, np.ndarray]
-            - 每台风机的净发电量 (N_turb,)
-            - 每台风机的理论发电量 (N_turb,)
+            - 每台风机的净发电量 (kWh)
+            - 每台风机的理论发电量 (kWh)
             - 每台风机的功率损失来源矩阵 (N_turb, N_turb)
         """
-        sector = self.wind_resource.sectors[sector_idx]
+        if wind_resource is None:
+            wind_resource = self.wind_resource
+
+        sector = wind_resource.sectors[sector_idx]
         freq = sector.frequency
         wind_dir = sector.direction_center
         c = sector.weibull_c
         k = sector.weibull_k
 
-        pdf = self.wind_resource.weibull_pdf(self._speed_centers, sector_idx)
+        pdf = wind_resource.weibull_pdf(self._speed_centers, sector_idx)
         prob = pdf * self.speed_step
 
         total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
@@ -263,7 +272,6 @@ class AEPCalculator:
 
         gross_power = self._power_lookup
 
-        hours_per_year = 8760.0
         weighting = freq * hours_per_year * prob
 
         gross_aep_sector = np.sum(gross_power * weighting, axis=1)
@@ -278,6 +286,55 @@ class AEPCalculator:
         )
 
         return net_aep_sector, gross_aep_sector, loss_by_source
+
+    def compute_period_energy(
+        self,
+        positions: np.ndarray,
+        wind_resource: WindResource,
+        hours: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """计算给定时段（任意风资源与小时数）内各机组的毛发电量与尾流后电量。
+
+        扇区频率在该时段风资源内部归一化（和为1），小时数只在此处乘一次，
+        供运行情景做逐时段积分，避免与全年8760小时或时段权重重复计入。
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            风机位置 (N_turb, 2)
+        wind_resource : WindResource
+            该时段的风资源（各扇区频率和为1）
+        hours : float
+            该时段的小时数（单次出现）
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            - 每台机组的毛发电量 (MWh)，即无尾流理论电量
+            - 每台机组的尾流后电量 (MWh)，尚未扣除不可利用与限发
+        """
+        positions = np.asarray(positions, dtype=np.float64)
+        if positions.ndim != 2 or positions.shape[0] != len(self.turbines):
+            raise ValueError(
+                f"位置数组形状应为 ({len(self.turbines)}, 2)，实际为 {positions.shape}"
+            )
+        if hours <= 0:
+            raise ValueError(f"时段小时数必须为正，当前为 {hours}")
+
+        gross_kwh = np.zeros(len(self.turbines), dtype=np.float64)
+        net_kwh = np.zeros(len(self.turbines), dtype=np.float64)
+
+        for s_idx in range(wind_resource.num_sectors):
+            net_sector, gross_sector, _ = self._compute_sector_aep(
+                positions,
+                s_idx,
+                wind_resource=wind_resource,
+                hours_per_year=hours,
+            )
+            gross_kwh += gross_sector
+            net_kwh += net_sector
+
+        return gross_kwh / 1e3, net_kwh / 1e3
 
     def _compute_loss_by_source(
         self,
@@ -462,31 +519,10 @@ class AEPCalculator:
         """
         positions = np.asarray(positions, dtype=np.float64)
 
-        n_turb = len(self.turbines)
-        net_aep = 0.0
+        _, net_mwh = self.compute_period_energy(
+            positions,
+            self.wind_resource,
+            hours=8760.0,
+        )
 
-        for s_idx in range(self.wind_resource.num_sectors):
-            sector = self.wind_resource.sectors[s_idx]
-            freq = sector.frequency
-            wind_dir = sector.direction_center
-            k = sector.weibull_k
-            c = sector.weibull_c
-
-            pdf = self.wind_resource.weibull_pdf(self._speed_centers, s_idx)
-            prob = pdf * self.speed_step
-
-            total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
-
-            effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit[:, np.newaxis])
-
-            for i in range(n_turb):
-                power = np.interp(
-                    effective_speeds[i],
-                    self._power_curves[i][:, 0],
-                    self._power_curves[i][:, 1],
-                    left=0.0,
-                    right=0.0,
-                )
-                net_aep += float(np.sum(power * prob * 8760.0 * freq))
-
-        return net_aep / 1e3
+        return float(np.sum(net_mwh))

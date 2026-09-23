@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "mode": "monthly",
+  "curtailment_strategy": "proportional",
+  "availability": 1.0,
+  "speed_factors": [1.15, 1.12, 1.05, 1.0, 0.92, 0.85, 0.82, 0.83, 0.9, 1.02, 1.1, 1.14],
+  "grid_capacity_mw": [null, null, null, null, null, null, null, null, null, null, 8.0, null],
+  "periods": []
+}
